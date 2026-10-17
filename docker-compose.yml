@@ -1,0 +1,27 @@
+# Pinned so every git worktree shares this one container instead of starting a
+# second Postgres; each worktree keeps its own database inside it
+# (`pnpm db:worktree`, docs/operations/local-development.md). Port 5435, so it
+# runs beside the en-escena app's Postgres (5433) during the rebuild.
+name: enescena
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: enescena-postgres
+    restart: unless-stopped
+    ports:
+      - "5435:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: enescena
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d enescena"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:

@@ -1,0 +1,85 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# Reviews are in English. En Escena holds personal data of dancers, many of them
+# minors (Ley 25.326), and issues invoices through ARCA: the path instructions below
+# name the rules a reviewer must enforce, and their sources are loaded as the
+# knowledge base.
+language: en-US
+reviews:
+  auto_review:
+    enabled: true
+    base_branches:
+      - "main"
+  review_status: false
+  high_level_summary: false
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+  # Findings are fixed by the author or by a deliberate agent, verified against the
+  # source first; CodeRabbit pushing its own fixes would race them.
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    autofix:
+      enabled: false
+    fix_ci:
+      enabled: false
+    resolve_merge_conflict:
+      enabled: false
+    simplify:
+      enabled: false
+  path_filters:
+    - "!pnpm-lock.yaml"
+    # Generated: Drizzle snapshots and the TanStack route tree. The SQL next to them
+    # is reviewed (src/db/migrations/*.sql is deliberately not excluded).
+    - "!src/db/migrations/meta/**"
+    - "!src/routeTree.gen.ts"
+  path_instructions:
+    - path: "**/*"
+      instructions: >-
+        Review against docs/agents/coding-standards.md. Its code language rule:
+        Spanish only in user-facing strings (UI copy, page titles, URLs, route
+        filenames, the body of a thrown Response); identifiers, comments, test
+        names, thrown Error messages, docs, commits and PR text are English.
+        `comprobante` is the only Spanish term allowed in identifiers.
+        Flag any new or widened directive that disables or suppresses a lint,
+        type-checker or other static-analysis diagnostic (a line comment, a
+        file-level comment or a config entry): each needs a written reason.
+        Flag personal data (names, document numbers, document photos, emails,
+        phone numbers) in logs, thrown error messages, analytics or alerts.
+    - path: "src/**/*.tsx"
+      instructions: >-
+        Also review against docs/agents/style-guide.md for colours, spacing,
+        typography, shadcn/ui conventions and the tone of the Spanish copy.
+        Review only the changed lines.
+    - path: "src/db/migrations/**/*.sql"
+      instructions: >-
+        Migrations are immutable once on main: an edit to an applied .sql file, even a
+        comment, is a finding (scripts/migrations/journal.mjs explains why). Every table
+        and enum lives in the enescena schema, unprefixed (docs/adr/0021). Flag DROP,
+        RENAME, and column type changes that break the still-running previous container
+        (squawk rules), and any lock-heavy ALTER on a populated table without a stated
+        reason.
+    - path: "src/db/schema/**"
+      instructions: >-
+        Tables and enums are declared with enescena.table() / enescena.enum(), never
+        pgTable or pgEnum (docs/adr/0021). Names match GLOSSARY.md identifiers.
+    - path: "scripts/migrate.mjs"
+      instructions: >-
+        This runs at container start in production. Flag changes that could let a
+        migration failure start the app anyway, log a connection string, or retry a
+        deterministic error.
+    - path: "Dockerfile"
+      instructions: >-
+        The runtime image must not carry dev dependencies, .env files, or the test
+        suite. Flag any base image or action pin that is not exact.
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - docs/adr/*.md
+      - docs/agents/coding-standards.md
+      - docs/agents/style-guide.md
+      - GLOSSARY.md
+      - AGENTS.md
