@@ -25,8 +25,10 @@ current `main`.
 
 ## What `checks` does, in order
 
-1. **Fetch `origin/main`** with full history, once, for every step below that
-   compares against it. Never `--depth=1`: fallow needs the merge base.
+1. **Check `origin/main` is present**, with full history, for every step below
+   that compares against it. The checkout's `fetch-depth: 0` fetches it; a second
+   `git fetch` would fail on this private repository, whose checkout keeps no
+   credentials. Never shallow: fallow needs the merge base.
 2. **gitleaks** over `origin/main..HEAD` (the PR's own commits). Rules in
    `.gitleaks.toml`. The same scan runs locally as the first line of
    `.vite-hooks/pre-commit`, where it is optional; CI is the blocking half.

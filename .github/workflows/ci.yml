@@ -37,12 +37,15 @@ jobs:
           # migration checks compare against `origin/main`.
           fetch-depth: 0
           persist-credentials: false
-      # `origin/main` with its full history, once, for every step that compares this
-      # branch against main: gitleaks, the migration checks, the dependency audit and
-      # fallow, which needs the merge base. Not `--depth=1`: a shallow main can cut
-      # the merge base off, and fallow then exits 2 instead of judging the branch.
-      - name: fetch origin/main
-        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+      # `origin/main` with its full history, for every step that compares this branch
+      # against main: gitleaks, the migration checks, the dependency audit and fallow,
+      # which needs the merge base. The checkout above already fetched it:
+      # `fetch-depth: 0` brings every branch with full history. A second `git fetch`
+      # here would fail, because the repository is private and the checkout keeps no
+      # credentials (`persist-credentials: false`); this step only proves the ref is
+      # there, so a missing base fails here rather than as a confusing step later.
+      - name: origin/main is present
+        run: git rev-parse --verify --quiet refs/remotes/origin/main
       # Secrets gate, first because nothing else matters if the branch carries a
       # credential. Rules are in `.gitleaks.toml` (picked up from the repository
       # root); `.vite-hooks/pre-commit` runs the same scan over the staged diff,
