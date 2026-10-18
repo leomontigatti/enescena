@@ -8,17 +8,29 @@ is not built here yet: these are the product decisions carried over from en-esce
 
 - **Operational, not showcase**: light surfaces, sharp hierarchy, medium density, for screens
   read and filled in all day.
-- **The base is shadcn/ui on Tailwind 4** (see [shadcn.md](./shadcn.md)), with the Geist
-  typeface and a neutral palette; the brand colour is En Escena's green (`#55c594`), used as an
-  accent, not as the primary.
+- **The base is shadcn/ui `radix-nova` on Tailwind 4** (see [shadcn.md](./shadcn.md)): base
+  colour `neutral`, the Geist typeface (`@fontsource-variable/geist`) for body and headings alike,
+  radius `0.625rem`. The tokens are en-escena's, in `src/styles.css`, light and `.dark`.
+- **The brand colour is En Escena's green (`brand`, `#55c594`)**, an accent, not the primary:
+  focus rings on fields, `link` buttons, progress.
+- **Semantic colours are tokens**: `success`, `info`, `warning` beside `destructive`, for badges,
+  alerts and toasts; a toast is coloured like its alert.
 - **Tokens and variants before classes.** A colour, radius or state comes from a token or a
   component variant; `className` is for layout (grid, flex, gap, width, margin). A case with no
   token gets a one-off class; a second case gets a variant or a component. A new token, variant
   or typeface is a product decision, not a fix.
-- **A state is a `Badge`**: a semantic variant when its meaning is stable, a neutral one
-  otherwise.
+- **A state is a `Badge`**: a semantic variant (`success`, `info`, `warning`, `destructive`) when
+  its meaning is stable, a neutral one otherwise.
 - **A shadcn component before custom markup**, added when the case fits it, never installed
   without a use.
+
+## Motion
+
+- **A record's name morphs from its row in a list into its detail page's title**, and back on
+  `Volver`: a 160 ms view transition of the name alone, while the rest of the page swaps at once,
+  with no crossfade. Reduced motion makes it instant. It comes from en-escena (its record title and
+  the `[data-record-title]` rules in `app/app.css`) and arrives with the first list and detail
+  screens.
 
 ## Viewports
 
