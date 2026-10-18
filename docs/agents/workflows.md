@@ -28,7 +28,7 @@ it is done and when to ask:
 ```
 Implement #12, open the PR and babysit it.
 Done means: the acceptance criteria pass, a regression test names the bug, and the
-PR is ready to merge. Stop only if the seams are unclear.
+PR is merged. Stop only if the seams are unclear.
 ```
 
 ## Investigate before recommending
