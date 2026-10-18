@@ -1,0 +1,22 @@
+node_modules
+.pnpm-store/
+.DS_Store
+.env
+.env.local
+*.local
+.output
+.nitro
+.tanstack
+.vite-hooks/_
+coverage
+tmp/
+
+# subagent and implement-spec worktrees
+.claude/worktrees/
+
+# playwright-cli scratch: snapshots, console logs, saved login state
+.playwright-cli/
+
+# lint probes tests/lint/adr-rules.test.ts writes and removes; a killed run can
+# leave them behind, and they break the rules on purpose
+tests/lint/.probes-*/

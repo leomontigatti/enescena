@@ -1,0 +1,1295 @@
+# Finances
+
+Canonical **current-state** description of the financial model: what the code
+does today, with no history and no supersession. The rationale — why the two-rung
+ladder was retired, what was rejected and on what fiscal footing — lives in
+[ADR-0014](../adr/0014-arbitrary-amount-allocation-and-comprobante-amendments.md),
+which ratifies [ADR-0009](../adr/0009-inscription-based-finances.md). Read those
+for _why_; read this for _what_. The identifier → UI term mapping is in
+[GLOSSARY.md](../../GLOSSARY.md).
+
+## How to read this document
+
+The settled model is larger than what is built. Half of it shipped; the invoicing half
+and the refund are specified and not implemented.
+Every statement here is therefore one of three things, and they are never mixed
+silently:
+
+- **Unmarked prose describes the code as it runs.**
+- **A `> **Specified, not built.**` callout describes the settled target**, with
+  the issue that owns it. Do not read those as behaviour.
+- **A `Known divergence` paragraph** records a place where the code disagrees
+  with the model on purpose or by defect, with the issue tracking it. The word
+  is this document's own: the price-divergence guard is unrelated, and names a
+  divergence between two prices rather than between the code and this model.
+
+When this document and the code disagree anywhere else, the code is right and
+this document is a bug — file it, do not fix one side silently.
+
+## Scope
+
+- The `Inscripción` is the canonical economic unit, and `Pago` plus
+  `Asignación de pago` are the operational source of truth.
+- **Nothing financial is persisted.** Statuses, thresholds, owed figures and
+  anomalies are all derived on read. The only stored fields on an inscription are
+  `selectedPriceId` (which price row prices it) and `withdrawnAt` (roster state).
+  That is ADR-0009, re-ratified rather than relaxed.
+- A `Comprobante` is a document _derived_ from inscriptions, payments and
+  allocations. It never governs financial state.
+- Finances does not audit changes, and neither does the rest of the system.
+- Persisted monetary amounts are whole Argentine pesos; the UI shows no cents.
+  Percentages are integers on the event row; amounts are rounded to the nearest
+  peso with `Math.round` (half up, toward `+∞`) at the point they are derived.
+- `Administrador` mutates financial records; `Auditor` reads them.
+- Out of scope and deliberately undefined: `Descuento administrativo` (see
+  "`Descuento administrativo`").
+
+## The model in one statement
+
+Money is allocated in arbitrary amounts against **two thresholds**. An
+inscription holds a price row and a sum of allocations; where that sum falls
+relative to `Seña` and `Total` is its status, and the difference in either
+direction is what it owes or what is in excess. Nothing marks a crossing, so
+every figure re-derives from money and can move in both directions.
+
+## Inscriptions
+
+- An `Inscripción` links one choreography to one dancer and has its own
+  **stable identity** (`id`), not the composite choreography+dancer key.
+- It carries `selectedPriceId` and `withdrawnAt` and nothing else financial.
+  `(choreographyId, dancerId)` is unique among the rows **on the roster**
+  (`choreography_dancer_unique` is partial on `withdrawnAt is null`): one active
+  row per dancer per choreography, beside any withdrawn ones.
+- Adding a dancer to a roster creates an inscription with no money on it, so it
+  is born `Seña pendiente`. Adding a dancer who was withdrawn does the same: it
+  **inserts a new row**, and the withdrawn one stays as it was (see "Withdrawal
+  from the roster").
+
+The `Inscripción` has a **second kind**. The `seminarInscription`
+(`docs/domain/seminars.md`) is an allocation target in the same academy pool,
+with the same `Pago`, the same `Asignación de pago`, the same `Saldo disponible`
+invariant and the same `Comprobante`; there is no separate seminar payment. `inscription` is
+therefore the umbrella term and the choreography–dancer link is the
+**choreography inscription**. The seminar inscription carries the same two fields
+and nothing else financial — `selectedPriceId`, referencing a `seminarPrice`, and
+`withdrawnAt` — and no `academyId`: its academy is read through the person, and
+the allocation row's own `academyId` covers the pool side. Where a seminar
+inscription differs from a choreography one, this document names it; where it says
+nothing, the rule reads the same for both kinds.
+
+### Inscription financial status
+
+Read from `Σ allocations` against the two thresholds, recomputed on every read.
+**Nothing is written when a threshold is crossed**, in either direction.
+
+| UI               | Value            | Definition                                    |
+| ---------------- | ---------------- | --------------------------------------------- |
+| `Seña pendiente` | `depositPending` | `Σ allocations < depositAmount`               |
+| `Señada`         | `depositMet`     | `depositAmount ≤ Σ allocations < totalAmount` |
+| `Pagada`         | `paidInFull`     | `Σ allocations ≥ totalAmount`                 |
+
+The values are English and the field is `status`, not `state`. `paidInFull`
+rather than `paid` is deliberate: the boundary is `≥`, not `=`, because passive
+over-allocation is tolerated.
+
+An inscription whose price cannot be resolved has no thresholds, and reads
+`Seña pendiente`: a threshold that cannot be computed cannot have been crossed.
+
+`Señada` says the deposit is covered and nothing more: it neither gives nor
+takes a `presentation`. It is computed **undiscounted** —
+`depositAmount` comes off the price before any discount, so the threshold cannot
+move under an academy when a sibling roster changes a discount tier.
+
+### Choreography financial status
+
+- The **minimum** over the choreography's active inscriptions on the scale
+  `depositPending < depositMet < paidInFull`. One uncovered dancer pulls the
+  whole choreography down, because the badge answers _is every dancer of this
+  choreography covered_.
+- It is a minimum and **not a watermark**. The watermark it replaced let a
+  choreography with a straggler read `Señada`, and `deriveChoreographyNeedsAttention`
+  existed only to compensate for that; both are gone.
+- A choreography with no active inscriptions reads `Seña pendiente` — unless it
+  is itself withdrawn, which is the only way it gets there.
+- Withdrawn inscriptions are excluded from this rollup and from the
+  choreography's `registrationCount`. They stay in the money rollup.
+- A **withdrawn choreography** is cut the same way one level up: its retained
+  money stays in its own rollup and in its academy's totals, and it is out of
+  the status rollup and out of every count, so its `registrationCount` is `0`
+  and no surface reads a financial status off it — `Retirada` replaces it. The
+  status the row carries while withdrawn is `paidInFull`, the harmless maximum
+  of a minimum rollup, for the same reason a withdrawn inscription carries it.
+- It is not persisted, and it sorts and filters like any derived column.
+- It **may drop back**: a roster change or a de-allocation can un-stick `Pagada`.
+  That is accepted; nothing prevents it and nothing records that it happened.
+
+## The four figures
+
+Every figure is derived on read; none is persisted.
+
+```
+depositAmount       = round(selectedPrice.amount × event.requiredDepositPercentage / 100)
+totalAmount         = selectedPrice.amount − liveDancerDiscountAmount
+owedDepositAmount   = max(0, depositAmount − Σ allocations)
+owedBalanceAmount   = max(0, totalAmount   − Σ allocations)
+overAllocatedAmount = max(0, Σ allocations − totalAmount)
+```
+
+- **Scope-owned, and the academy scope is the narrow one.** `inscription`
+  (`InscriptionFinancialFigures`) and `choreography`
+  (`ChoreographyOperationalFinanceRow`) each carry all four —
+  `depositAmount`, `totalAmount`, `owedDepositAmount`, `owedBalanceAmount`. The
+  academy scope (`OperationalFinanceSummary`) carries only the two owed ones,
+  alongside `availableBalanceAmount` and `totalPaidAmount`: there is **no
+  academy-level `depositAmount` and no academy-level `totalAmount`**. Where a
+  wider scope does carry a figure it is a plain sum of the narrower ones; there
+  is no separate per-scope rule and no per-status aggregation.
+- **The discount is applied once, inside `totalAmount`**, with no coalesce and no
+  third subtrahend, so every consumer inherits it and none can forget it.
+- **`Seña adeudada` and `Saldo adeudado` are gross.** Neither subtracts
+  `Saldo disponible`, which is shown alongside as its own figure. They are also
+  **not disjoint**: an inscription with no money contributes its deposit
+  shortfall to one and its total shortfall to the other. They are two cuts of the
+  same debt, and `Seña adeudada ≤ Saldo adeudado` always holds.
+- **A registered inscription is owed in full from the moment it exists.** There
+  is no "not yet due" debt.
+- `requiredDepositPercentage` is an event-level `Bases del evento` setting,
+  a not-null integer defaulting to `30`.
+- If no price resolves for an inscription, its thresholds are `null` and the
+  amounts it contributes are **pending or incomplete, not zero**. The UI shows
+  `Sin precio` for that cell.
+
+Every figure an academy reads on a **finance surface** is **exact and is exactly
+what must be paid**. Those surfaces carry no tentative amounts and no
+provisional-figure cue: a marking true of every figure distinguishes nothing.
+
+The dancer detail's inscriptions tab — admin and portal, not a finance surface —
+reads its `Precio base`, `Descuento` and `Total` through the same thresholds
+owner the write path uses (`readInscriptionThresholds`), so it carries no
+provisional cue either: the `Subtotal estimado` heading and its disclaimer are
+gone with the dateless resolution they excused.
+
+The superseded per-inscription `Saldo de inscripción` (`base − deposit −
+discount`) is **gone, not renamed**: both of its subtrahends moved.
+
+A seminar inscription's figures:
+
+```
+depositAmount = round(effectiveSeminarPrice.amount × seminar.requiredDepositPercentage / 100)
+totalAmount   = effectiveSeminarPrice.amount
+```
+
+The rate is the **seminar's own** (1 to 99, default 50), never the event's
+`requiredDepositPercentage`. There is **no discount**: a seminar inscription
+neither enters the `Descuento por bailarín` qualifying set nor receives it,
+because the participant row already is the reduction for "also dancing". The
+owed figures, the status table and `Sin precio` read exactly as above. The
+academy scope's `owedDepositAmount`, `owedBalanceAmount` and `totalPaidAmount`
+are **one figure each, summed over both kinds** — one debt against one pool —
+and `availableBalanceAmount` is already pool-wide; a surface may break a total
+down by kind, the read model does not. The unit a seminar's money rolls up into
+is the `(seminar, academy)` pair, not the seminar: a seminar is shared by every
+academy while a debt belongs to one.
+
+**Covering the deposit** is the seminar's own reading of the crossing: it is
+what keeps a place in the quota for good and what freezes the seminar's kind
+and rate. Before it, a recent registration may hold a place for a while as a
+`seminarReservation` (`docs/domain/seminars.md`, "The place"). A
+withdrawn row is covered by nothing — it keeps its money and gives its place
+back. One predicate owns it, on the stored row's deposit, as everywhere else.
+
+## `Descuento por bailarín`
+
+- The only automatic discount. It lives per inscription and enters `totalAmount`
+  and nothing else.
+- **It is always live**: recomputed on every read, before and after a comprobante
+  alike. There is no freezing moment, no granted-amount column and no
+  carry-forward. It cannot be gated on the financial status, because it enters
+  `totalAmount` and `totalAmount` is what decides the status — gating it would be
+  circular.
+- **Qualifying set**: the dancer's **registered** active inscriptions in the same
+  **academy and event**, whatever their status. Withdrawn inscriptions and
+  inscriptions with no resolvable price are excluded.
+- Tiers, by the size of that set: 1 or 2 → no discount; 3 → 10%; 4 or more → 15%.
+- **The most expensive inscription of the set is left at full price.** The set is
+  sorted by price descending and the first row gets nothing; every other row gets
+  `round(price × percentage / 100)`. The percentage is derived from the size of
+  the whole set, exempt row included.
+- **On a price tie the winner is decided by the inscription's `id`**, which is a
+  UUID, so the tie-break is arbitrary rather than chronological. Ties are the
+  common case, not the exception: inscriptions in the same choreography share a
+  price row. It does not move money — a tie means the prices are equal, so the
+  academy's total is the same whichever row is exempted — but an admin asking
+  "why is this one at full price?" has no answer. A date-based rule cannot be
+  implemented as written: `choreography_dancer` has no `createdAt` column.
+- Because the qualifying set spans an academy and an event, **registering a
+  dancer in choreography B changes the total of choreography A**, whose own
+  roster was untouched. The academy is told nothing; A's total is simply correct.
+
+**Known divergence — the read path pools across academies.** The write path
+scopes the qualifying set to `academyId + eventId`, as documented. The read path
+buckets by `dancerId` alone over rows already restricted to the event and the
+requested academies, and the admin finances list requests **every academy of the
+event**. A dancer registered by two academies of the same event is therefore
+pooled in that list and not at the write, so the list can display a discount the
+write will refuse to grant. The single-academy readers pass one academy id and
+are unaffected. It is a **bug, not a documented rule**; the owner of the shared
+predicate is [#489](https://github.com/leomontigatti/en-escena/issues/489).
+
+## `Descuento administrativo`
+
+`Descuento administrativo` is **reserved and deliberately undefined**. It was
+ruled out of scope, which is a scoping act and not an answer: its own
+questions — scope, place in `totalAmount`, whether it fixes, persistence,
+authority — are left standing.
+
+Three reasons it was closed rather than decided: nothing on the map depends on it
+(all twenty-one decisions were re-read and it appears in none); the common case is
+already served, because an administrator can pick the price row explicitly and a
+price row is where a commercial arrangement belongs; and the reason it keeps being
+deferred is structural — **it is the one figure in the model with no derivation
+behind it**, so it must be persisted, which is exactly the exception ADR-0009
+forbids. Whoever defines it has to argue for that exception.
+
+The term stays reserved. It is **not** tombstoned, and its absence here is a
+decision rather than an oversight.
+
+## Prices
+
+- An inscription is priced by **one price row**, held as `selectedPriceId`.
+- The **effective price** is `crossed ? stored : (current ?? stored)`: the stored
+  row once the inscription has crossed its deposit threshold, and otherwise the
+  currently applicable row, falling back to the stored one when no row applies at
+  all. When neither resolves there is no price and the inscription's figures are
+  incomplete.
+- **The stored row is the one the administrator picked**, never one the system
+  chose by date. An allocation write stores the row named in the dialog, and a
+  preset stores its per-group-type choice. The only validation is membership of
+  the choreography's candidate set — same event, same group type, and either a
+  special row covering the choreography's own schedule or a general one — **with
+  no date filter at all**, so a row whose `paymentDeadline` has passed can be
+  selected and stored.
+- **A special price covers any number of schedules.** Its links live in
+  `price_schedule`, one row per schedule, and `price.isSpecialPrice` says which
+  tier the row belongs to; a general row has no links. `loadPriceRows`
+  (`app/lib/prices/rows.server.ts`) is the one reader, handing every consumer the
+  row with its `scheduleIds`. The retired `price.schedule_id` column is still in
+  the table, unread, until its contract step drops it.
+- **Which schedules a special price covers is not structure.** A price an
+  inscription stored is frozen except for its name and its schedules: adding a
+  schedule touches no stored inscription, and dropping one is refused, naming
+  it, while an inscription that stored the price sits on it — the rule a
+  schedule's modalities follow.
+- **A price row may carry no `paymentDeadline`.** That row is the one that
+  applies once every dated row of its tier has expired: it survives the date
+  filter and sorts last among the survivors, so it can only win when nothing
+  dated is left. Adding one is a no-op until then. There can be at most one per
+  `(event, group type)` among the general rows and one per `(schedule, group
+  type)` among the special ones, enforced by `price_general_unique` and
+  `price_schedule_tier_unique` — both `NULLS NOT DISTINCT`, because two of them
+  would otherwise be separated only by amount. The same holds for every dated
+  deadline: two special rows of one group type and deadline cannot cover the
+  same schedule, which is why `price_schedule` carries copies of the price's
+  group type and deadline, rewritten with the links on every save.
+- **The business date** — today in the business time zone, never a payment's date
+  — appears only on the **read** path, and only inside
+  `app/lib/finances/inscription-price.ts`, the single owner of applicable-row
+  selection. `selectApplicableInscriptionPrice` resolves the currently
+  applicable row, preferring a special row of the choreography's group type
+  that covers its schedule, then the general row for that group type; both tiers go through
+  `selectApplicablePriceCandidate`, which owns the deadline filter and the
+  nearest-deadline / lowest-amount tie-break and has no dateless overload.
+  `resolveApplicableInscriptionPrice` (`inscription-price.server.ts`) is the same
+  rule from the database, the transaction entry point for a caller that only
+  holds the key; no production path calls it yet — every reader already has the
+  event's rows loaded — and its db tests pin the rule against real rows.
+- **The price is fixed by the deposit threshold crossing, not by the first peso
+  and not by the calendar.** Below the threshold nothing is fixed: an allocation
+  write may store a different row whatever the inscription already holds, and the
+  read does not treat the stored row as authoritative — it re-derives from the row
+  that applies today, so a page refresh moves the effective price and so does the
+  passage of time. Once `Σ allocations` reaches the deposit of the row the
+  inscription **stores**, that row governs: the write path refuses a different one
+  with `El precio queda fijo desde que la inscripción cubre su seña…`, and a
+  database trigger on `choreography_dancer` refuses the same update. **Taking
+  money off until the row falls back below its deposit is what releases the lock** —
+  not taking every peso off.
+- **The seminar inscription has a trigger of its own, not a shared one.** It is
+  the same rule re-keyed: it skips when the stored row does not move or is
+  absent, opens when nothing is allocated, and otherwise derives the deposit from
+  the stored `seminar_price` joined to the **seminar's** own
+  `requiredDepositPercentage`, never the event's, summing allocations by the
+  seminar target. A single function branching on the table would have to name
+  both tables in every branch; two functions each name one.
+- **`crossed` is always tested against the stored row**, never against the
+  incoming or the currently applicable one. The threshold is derived _from_ the
+  price, so the answer would otherwise depend on which price is asked about: 1000
+  allocated is crossed against a price of 3000 and un-crossed against one of 10000. Testing against what is stored is what stops the rule being circular.
+- **A write that names no row leaves whatever is stored untouched, and nothing
+  refreshes the stored row on its own.** Below the threshold the stored row is
+  still worth writing, because it is what the read falls back to when no row
+  applies at all.
+- **The price list can roll down under a partly funded inscription.** Below its
+  threshold an inscription follows the list, so a drop can leave it holding more
+  than its `Total` and reading `Sobreasignada`. That is passive over-allocation
+  and it is tolerated: it warns, it blocks nothing and nothing throws.
+- **`Señada` and the price lock read the same `≥` against two different deposits.**
+  The badge is derived from the **effective** price, and the lock is measured
+  against the **stored** one, so when the stored row is dearer than the one that
+  applies today there is a band where the row reads `Señada` and its price is
+  still loose: stored 12000 (deposit 3600), current 10000 (deposit 3000), 3000
+  allocated — the badge crosses at 3000 and the lock does not close until 3600.
+  The asymmetry is one-sided, because the lock is never the earlier of the two:
+  a locked price is the stored one, and it is the stored one the badge is then
+  computed from. So `Seña pendiente` next to a fixed price cannot happen, and
+  `Señada` is a claim about the money against today's price rather than a claim
+  that the price has stopped moving.
+- The picker is filtered to the choreography's group type and schedule — the
+  general rows and the special rows covering that schedule — and to nothing
+  else — no floor, no ceiling and no `paymentDeadline` — because offering
+  a foreign row would be offering to create a forbidden state, whereas offering
+  an expired one would not.
+- A price row that any inscription references **cannot be deleted**.
+
+- **The mechanism is read-time derivation, by decision.** ADR-0014 §3 as
+  written specified a write-path refresh of `selectedPriceId` below the
+  threshold, a `NOT NULL` column written at creation, and a refresh on a
+  `groupType` change; its correction of 2026-09-09 withdraws all three and
+  adopts what runs. The stored row is written only by the act of charging and is
+  never refreshed on its own; every figure on every surface comes from the same
+  derivation — `resolveEffectiveBasePriceRow` is its single owner — so no two
+  surfaces can disagree, and the answer moves with a page refresh and with the
+  passage of time. That movement is the point: an academy's price follows the
+  list until its deposit is in, without anyone writing anything. The
+  circularity the ADR worried about is broken by the clause above — `crossed`
+  is tested against `stored`, the one side that does not depend on the answer —
+  and not by which path derives.
+- Below the threshold the **stored row and the effective row can differ**, so
+  what reads which matters. The stored row is read by the write path's
+  `crossed` test, by the `?? stored` fallback when nothing applies today, and by
+  the guard that refuses to delete a referenced price row — all of them
+  server-side. It is not read by anything the administrator sees: every
+  displayed **figure** and every control — `Precio`, `Seña`, `Total`, the badge,
+  and both the allocation dialog's readout and its picker — comes from the
+  effective row. The one exception is the seminar preset's preview, which
+  names a charge rather than a state: it shows the row the charge prices with,
+  the held one (see "Per seminar").
+- **`Sin precio` is a state, not a defect.** An inscription that stores no row
+  and that no row applies to today has null thresholds and incomplete figures.
+  Portal creation is gated on price coverage by event readiness, which is where
+  the signal belongs; nothing refuses an inscription for lacking a price at
+  creation, and presets can leave a row holding money and storing no price.
+
+**A seminar inscription is priced the same way**
+`seminarInscription.selectedPriceId` is nullable, references a
+`seminarPrice` row, is written only by the allocation dialog, and the effective
+row is `crossed ? stored : (current ?? stored)` through the same owner,
+`resolveEffectiveBasePriceRow`, fed the seminar's own
+`requiredDepositPercentage` and a candidate set with **no schedule or group-type
+axis**: the event's `seminarPrice` rows of the seminar's `seminarKind` for the
+person's participant cell, falling back to the `regular` rows when the kind has
+none, with no fallback on the participant axis. The business date then picks
+among them through `selectApplicablePriceCandidate`, one call into the owner. The
+stored row carries its own `forParticipants` flag, so the crossing freezes the
+tier and the participant fact in one column and nothing else is persisted. The
+picker offers the same candidate set with no date filter, as the choreography
+picker does. A price row referenced by any seminar inscription cannot be deleted
+or restructured, and a seminar's kind cannot flip while any of its inscriptions
+is covered — which closes, for seminars, the known divergence below. The
+`Señada`-without-a-place band this creates for the seminar quota is named in
+`docs/domain/seminars.md`, "The place".
+
+**A roster change cannot leave a crossed price on the wrong group type.**
+Nothing refreshes `selectedPriceId`, so a roster change that moved the group
+type under a **crossed** inscription would leave it holding a row of the old
+one: a `Solo` paid in full that becomes a `Dúo` would keep the `Solo` row and
+keep reading `Pagada`. The amount comparison of the price-divergence guard
+cannot see it, since a crossed inscription is charged its stored row on both
+sides. So the group-type axis has its own check, `hasGroupTypePinnedInscription`
+in the same module: the draft save of the choreography detail is refused while
+an active inscription whose dancer stays is frozen on a row of another group
+type, whether or not the schedule moves. The preview shows it beside the dancers
+before the save, and the save asks again under the choreography's row lock. The
+remedy is taking the money off first; nothing rewrites the stored row. The save
+also locks the choreography's active inscriptions, and the allocation dialog and
+the `Pagar seña` / `Pagar saldo` presets lock theirs before they read the group
+type, so a deposit crossed in a racing transaction is either read by the save or
+priced against the group type it commits. Below the threshold the read-time
+derivation follows the new key on its own, as long as the row stored there is
+replaced before the money crosses: the dialog submits the row in effect, and
+when it submits none over a stored row of another group type the server stores
+the row in effect itself; a preset with no pick for the choreography's group
+type refuses an inscription storing a row of another one. The schedule
+axis is closed too: a general row prices every schedule, and the guard refuses a
+move that takes a crossed inscription off the schedules its special row covers.
+Production held no crossed row on a foreign key when this landed (#660, counted
+2026-10-06).
+
+- **The dancer detail prices with the finance rules.** `findDancerInscriptions`
+  reads each inscription through `readInscriptionThresholds`, so the tab shows
+  the effective price against today's business date, the stored row once the
+  deposit is covered, the live `Descuento por bailarín`, and `Sin precio` when
+  nothing resolves — the same figures as the finance surfaces for the same
+  inscription. The dateless resolver it used to call is retired; nothing
+  resolves a price without the business date any more.
+
+## Payments
+
+- Administration registers a payment before or after allocating it.
+- A payment requires an academy, the active event, a date, a positive amount and
+  a payment method. Corrections are made by editing or deleting the payment,
+  never by registering a negative or zero one.
+- **A payment is editable after the fact.** The admin payment detail carries a
+  full edit form — academy, amount, date, method, reference and internal note —
+  and it writes all of them. **Exactly two accounting guards stand in its way**,
+  and nothing else:
+  - the **academy is frozen once the payment carries allocations**
+    (`No se puede cambiar la academia de un pago con asignaciones activas.`), so a payment
+    registered against the wrong academy is re-pointed by editing while it is
+    still unallocated;
+  - the **amount cannot drop below what is already allocated**
+    (`El monto no puede ser menor al total ya asignado.`). It rises freely, and it falls freely
+    down to that floor.
+
+  Editing a payment moves no allocation: the existing rows keep their amounts and
+  the difference lands in `Saldo disponible`.
+
+- The payment date cannot be in the future.
+- Payment methods: `transferencia`, `efectivo`, `mercado_pago` and `otro`.
+- A payment has a visible internal number, sequential within the event. It is not
+  a fiscal number.
+- Reference and internal note are optional; internal notes are not shown in the
+  `Portal de academias`. Uploading receipts is not built.
+- A registered payment stays in the academy's `Saldo disponible` until it is
+  allocated.
+- Payments and allocations do not cross academies. A payment registered against
+  the wrong academy is corrected by editing it while it holds no allocations, and
+  once it does, by taking its money off or deleting it.
+- **Deleting a payment cascades its allocations** at the database level. There is
+  no reversal order, no blocking case, and no automatic refill of what the
+  deletion freed.
+
+## Payment instructions
+
+`Instrucciones de pago` (`paymentInstructions`) is what an academy needs in
+order to pay an event: the bank identifiers of the account that receives the
+money, plus free text on how to pay. It records nothing about money received
+and is not a `payment`.
+
+- **It belongs to one event.** Administration loads it on the event detail;
+  there is no global account and no override chain. A new event starts empty.
+- **Five identifiers and one text**: `CBU/CVU` (one field, a CBU or a CVU,
+  never both), `Alias`, `Titular`, `Banco`, `CUIT del titular`, and
+  `Cómo pagar`. Every field is optional on its own.
+- **The identifiers form a group.** As soon as any of them is filled, the
+  `CBU/CVU` and the `Titular` are required — the alias can be re-pointed by
+  its holder at any time, and the holder name is what the payer's bank shows
+  before confirming. `Banco`, `Alias` and `CUIT` stay optional. The text can
+  stand alone.
+- **Validation refuses, it does not warn.** The `CBU/CVU` must have 22 digits
+  and both of its check digits; the `Alias` has 6 to 20 characters of letters,
+  digits, dot and hyphen, and is stored lowercased; the `CUIT` has 11 digits
+  with its check digit and, if hyphenated, the hyphens at 2-8-1; the text is
+  plain, trimmed and at most 2000 characters. **No message claims a number is
+  "valid"**: a check digit only proves a digit is mistyped, never that the
+  account exists — only the payer's home banking shows that.
+- **"Loaded" means the group is present or the text is present.** Only then
+  does the `Portal de academias` show anything.
+- **Always editable, silently.** The instructions are not structural: they
+  change while the event runs, with payments recorded, and the change is an
+  overwrite with no history and no notice to academies. Clearing every field
+  is a plain save.
+- **Registration readiness ignores them.** Missing instructions never block
+  `Abrir inscripciones` on a `Cronograma`.
+- **Where they show**: the payments page of the `Portal de academias`, as an
+  info note between the page subtitle and the payment list or its empty state,
+  in the `Evento activo` only, with a copy control on the `CBU/CVU` and the
+  `Alias` and the `Titular` and `CUIT` read together; and the same note above
+  the payments of an individual's `Pagos` (see [Surfaces](#surfaces)).
+  Nowhere else — not the academy's finances
+  page, not the portal home, not any admin list.
+
+## Payment allocations
+
+An `Asignación de pago` is **an amount against an inscription** — the triple
+`(payment, inscription, amount)` — and mutable, deletable current state rather
+than an append-only ledger.
+
+- Stored fields, besides its own `id`: `paymentId`, the target pair
+  `choreographyInscriptionId` / `seminarInscriptionId`, `academyId`, `eventId`,
+  `amount`, `createdAt`, `updatedAt`. **The row carries no type and no role**:
+  money is fungible, so an allocation is an amount and nothing else. There is no
+  `allocation_type` and no deletion rank.
+- **The target is either kind of inscription.** The two columns are nullable and
+  a CHECK requires **exactly one** of them set: a single column could not carry a
+  foreign key to two tables, and the pair with its CHECK says the same thing the
+  database can enforce. A supertype table and a parallel seminar allocation table
+  were both rejected — the only thing that varies per kind is how thresholds
+  resolve, and that is one seam inside the pool module.
+- **Unique on `(paymentId, choreographyInscriptionId, seminarInscriptionId)`,
+  created `NULLS NOT DISTINCT`.** At most one row per (payment, target); a
+  positive delta is an upsert that sums, and the clause is what keeps that upsert
+  to a single conflict target — without it Postgres would read the null half of
+  every target as distinct and each allocation would insert a second row.
+- **`amount > 0` by CHECK.** A decrement to zero **deletes the row**: a zero row
+  would assert a history this table does not hold. Negatives are ruled out
+  because `Σ allocations` would then be reachable by two different row sets.
+- All four foreign keys cascade on delete.
+- It stores no user attribution; the system does not audit.
+- One inscription's money can come from several payments, and one payment can
+  fund several inscriptions.
+
+The `comprobante_inscription` line carries the same pair, with two differences
+that follow from what a line is. Both targets are `set null` rather than
+cascading, and the CHECK allows **at most one** rather than exactly one: a line
+whose inscription was deleted after emission keeps its frozen amount with both
+columns null, which is the shape the fiscal figure survives in. Uniqueness is
+then **two partial indexes, one per kind**, each over `(comprobante, its own
+target)` and restricted to rows where that target is set — a single unique over
+both columns would have to treat nulls as equal to say anything at all, and two
+orphaned lines of one comprobante would collide.
+
+## The pool rules
+
+Funding an inscription and unfunding it are the two halves of one invariant, and
+they live in one module.
+
+- **The invariant**: `Saldo disponible = Σ payments − Σ allocations − Σ refunds`,
+  and it can never go below zero. The floor is **structural, not a clamp**: every
+  allocation is capped against what is still free, and the one way to shrink the
+  other side — editing a payment down — is floored at what that payment already
+  funds. There is no subtraction that could overshoot.
+- **Funding** — the administrator names an inscription and an amount, **never a
+  payment**. The system consumes the academy's payments **oldest-first by payment
+  number**, creating or incrementing the `(payment, inscription)` row until the
+  amount is covered. It refuses up front when the pool holds less than the amount
+  asked for.
+- **Unfunding** is the exact inverse: it consumes that inscription's allocations
+  **newest-first by payment number**, decrementing and deleting the row at zero.
+  The round trip is exact as long as what is unwound is the last thing funded. If
+  money is freed on an older payment in between, the total comes back the same
+  but may be split differently — no provenance is stored, which is precisely what
+  keeps a reversal order from coming back.
+- **Over-allocation.** **Active** over-allocation is refused on the write path,
+  with no override: a write that would push an inscription above its `Total` is
+  rejected with `No se puede asignar más de lo que la inscripción adeuda.`, which
+  is why owed is computed on the write path and not only on read. Allocating
+  against an inscription with no resolvable price is refused for the same reason
+  — there is no way to know what it owes. **Passive** over-allocation already
+  recorded is tolerated: it stays where it sits, stays readable, and only an
+  administrator moves it.
+- **The target.** Funding, unfunding and the delta they share take a **target**
+  `{ kind: "choreography" | "seminar", id }` rather than an inscription id, and
+  they stay single functions. The one per-kind piece is the threshold read behind
+  the over-allocation guard, chosen inside the module from the target's kind.
+  `Saldo disponible` is target-agnostic: an allocation row carries its academy
+  and its event whichever kind of inscription it points at, so an academy draws
+  on **one** pool and not one per kind.
+- **Accepted cost, stated plainly**: a specific payment can no longer be lifted
+  off a specific inscription. The remedy for a payment recorded in error is
+  deleting the payment, which cascades its allocations.
+- **The pool lock.** Checking the floor reads what is free and then writes, so
+  two writes for one academy and event on different inscriptions could each
+  spend the same free money. Every write that moves the pool therefore takes a
+  transaction-scoped advisory lock on the `(academy, event)` pair
+  (`lockAcademyPool`, in the pool module) before it reads what is free: funding
+  and unfunding, so every preset and every single-inscription gesture of either
+  kind; the payment edit, before it checks the payment still covers what it
+  funds; the payment deletion; and the academy merge, on both academies in every
+  event. The write that comes second reads what the first left, so of two
+  charges the pool can cover only one of, the second is refused with
+  `La academia no tiene saldo disponible suficiente.` Funding and unfunding take
+  it after the seminar and inscription locks their callers hold, never before
+  one, so it adds no lock order to deadlock on; the lock is re-entrant, so a
+  preset that spreads many times waits once. The payment edit and deletion
+  lock the pool the payment is in and read it again; one that moved academy
+  while they waited is refused with
+  `El pago cambió mientras se guardaba. Volvé a intentarlo.` rather than
+  locking a second pool, since holding two taken in move order would deadlock
+  against the merge, which takes them sorted. Registering a payment takes no
+  lock: it only grows the pool. Deleting an academy takes none either, since an
+  academy with payments cannot be deleted.
+
+- **The quota, for a seminar target.** Every money gesture whose target is a
+  seminar inscription locks the seminar row `FOR UPDATE` first, crossing or not
+  and before it reads anything else. Under that lock the funding write counts the
+  covered non-withdrawn inscriptions of the seminar **excluding the one being
+  funded**, plus the places other inscriptions hold as live reservations, and
+  refuses only the write that would cross the stored row's deposit from below
+  when that count already reaches the quota, with
+  `No quedan lugares en el seminario, así que esta inscripción no puede cubrir su seña.`
+  A partial allocation below the deposit goes through even when the seminar is
+  full, and money after the seminar started is money like any other. The order of
+  refusals is no price → over-allocation → **quota** → insufficient pool; the
+  pool ceiling stays last because it is the one the dialog cannot pre-check.
+  Taking money off refuses nothing: it only frees places
+  (`docs/domain/seminars.md`, "The place").
+
+> **Specified, not built.**
+> The `− Σ refunds` term has nothing behind it: there is no refunds table and no
+> refund code path, so `Saldo disponible` reads as `Σ payments − Σ allocations`.
+> ADR-0014 §6 specifies a `Reembolso` mirroring `Pago` — academy, event, amount,
+> date, `refundMethod` over the same method enum, `refundNumber` — that **never
+> carries allocations** and is capped at `Saldo disponible`. Owner:
+> [#536](https://github.com/leomontigatti/en-escena/issues/536). Note the term:
+> `Devolución` is reserved for the judge's private feedback audio and must not be
+> used for money.
+
+## The money gestures
+
+The administrator never picks a payment in either direction: they name an
+inscription and an amount, and the pool rules decide which payments it comes
+from. Neither is available on the academy portal, which is read-only.
+
+### Per inscription
+
+The choreography financial detail has **one entry point per inscription** — the
+dancer's name — and the dialog behind it takes its shape from what the row holds.
+
+| Row                       | What opens                                         |
+| ------------------------- | -------------------------------------------------- |
+| over-allocated            | `Liberar el excedente`: one click, nothing to type |
+| nothing owed, money on it | `Quitar dinero`, hinting everything allocated      |
+| anything else             | `Asignar dinero`: price and amount                 |
+
+A row that still owes something but already holds money reaches `Quitar dinero`
+from inside the allocation dialog, so removal is available wherever there is
+money to take off while the entry point stays single.
+
+- **Allocating.** Any amount is allocatable; a partial allocation is an ordinary
+  outcome and the row reads `Seña pendiente` with its shortfall, not as unpaid.
+  The owed figure is a **placeholder, never a prefilled value**, because the
+  discount is live and it moves while the dialog is open; the hint is whichever
+  figure finishes the next thing. The two owed figures are shown **only once the
+  inscription holds money**: on an empty row they restate the price named right
+  above them. Because the bound is known on the client, an amount above what the
+  row owes is said **under the field** (`Ingresá un monto entre $ 1 y $ X.`)
+  instead of round-tripping to
+  `No se puede asignar más de lo que la inscripción adeuda.`; the pool's own ceiling is not known here and stays an alert. The
+  **price is chosen inside this dialog and never in a table cell**, and it is a
+  readout rather than a picker once the row has **covered its deposit**. This is the
+  only one of the three gestures that can bounce.
+- **Removing.** The amount is **hinted with everything the inscription holds**,
+  as a placeholder and not as a prefilled value, and any smaller amount is
+  accepted. The hint can be a real figure — what is allocated is a fact and does
+  not move under the administrator — but it is typed like the allocation one, so
+  the two gestures behave the same. It unwinds newest-first and the released
+  amount returns to `Saldo disponible`. **Removing money never blocks for a
+  financial reason**: no threshold, no anomaly and no state of the pool can
+  refuse it. It still refuses the two nonsensical inputs — an amount of zero or
+  less (`El monto a quitar tiene que ser mayor a 0.`) and an amount larger than
+  the inscription holds (`La inscripción no tiene ese dinero asignado.`) — so a
+  caller must still defend those. Because the bound is known on the client, the
+  dialog says the range **under the field** (`Ingresá un monto entre $ 1 y $ X.`)
+  rather than round-tripping to those two refusals, which stay as guards
+  and still surface if the figure moved while the dialog was open. It is a
+  different action from removing the inscription from the roster.
+- **Releasing the excess.** One button that takes off exactly what the
+  inscription holds above its `Total` and nothing more. The excess is computed,
+  so there is nothing to pick and nothing to type.
+- **Neither removal shape shows a price control**, not even a locked one. Price
+  is an allocation-time concern, and taking money off until the row falls back
+  below its deposit is precisely what opens the lock.
+
+**The dialog locks the picker where the rule locks it**: at the deposit
+threshold. It used to swap the picker for a readout as soon as
+`allocatedAmount > 0` and to explain itself with
+`Para cambiarle el precio hay que quitarle todo el dinero.` — a retired rule, and a below-threshold price
+change was therefore accepted by every write path while being unreachable from
+the one screen that offers prices. Both the swap and that hint are gone.
+
+The dialog reads the threshold off the row's **effective** deposit while the
+write path tests the **stored** one, and the two agree wherever it matters: once
+the stored row is crossed, the effective row _is_ the stored row. They can differ
+only when the list moved _down_ under a row already holding money, where the
+dialog is the stricter of the two — the same direction the old first-peso lock
+erred in, and far rarer.
+
+The readout says exactly what the picker it replaces said — name, amount and
+`Seña` — through one formatter, so locking a row cannot quietly drop a figure the
+administrator was choosing by.
+
+**The readout and the picker both name the effective price.** They are the same
+row above the threshold and can differ below it, and both are fed by
+`readInscriptionEffectivePrices` — the same figure the row behind the dialog
+shows. The stored row does not travel to the client at all.
+
+The picker used to open on the stored row instead, which is what the
+administrator last said. That was wrong in a way that cost money rather than
+merely reading oddly: on a row holding nothing whose list had moved since, the
+picker named the old row while the amount placeholder and both owed figures
+named the current one, and confirming without touching it wrote the old row and
+then locked there as soon as the allocation covered the deposit — a deposit quoted at
+the current price, charged at it, and fixed at the old one.
+
+`Elegí un precio para la inscripción.` stays reachable, and it is worth being
+precise about when: the picker arrives filled whenever a row **applies today**,
+but the option list is not filtered by `paymentDeadline` while
+`resolveApplicablePriceRow` is. An event whose every row for that group type has
+an expired deadline therefore offers options, applies none, and leaves the picker
+on its placeholder — so a row storing nothing can still be submitted without a
+price, and the refusal is what catches it. It is the only path there:
+`applySelectedPrice` is reached from `allocateToInscription` alone, which this
+dialog is the only caller of. The presets have their own `applySelectedPrices`.
+
+**A seminar inscription opens the same dialog**, with its three shapes and its
+overlay, from the `(seminar, academy)` financial detail. It is the one dialog
+told which kind of target it is about, not a twin: the kind travels in the form,
+and each detail's action owns one of the two writers. Options and the locked
+readout read `{name} · {amount} · seña {deposit}` through the same formatter; the
+picker offers only the `seminarPrice` rows already filtered to the seminar's kind
+(then `regular`) and to the person's participant cell, with no date filter and no
+participant readout, and the only write is `selectedPriceId`. Every server
+refusal lands in the dialog's error alert, where the choreography ones land.
+
+### Per choreography
+
+`Pagar seña` and `Pagar saldo` survive as **list actions** over the chosen
+choreographies of an academy, not as rungs. They are presets over the figures:
+each allocates every active inscription's `Seña adeudada` or `Saldo adeudado`
+from the pool, skipping the ones that owe nothing, and the pool decides which
+payments it comes from. A preset is **all or nothing** — if the pool runs dry
+partway through, or any inscription is refused, the whole charge rolls back and
+the administrator who sees an error can trust that nothing moved. A preset
+selects and stores a price row only for inscriptions that have not covered their
+deposit yet; anything already past that threshold keeps the price it holds.
+The dialog's owed figure follows its price pickers, and when it exceeds
+`Saldo disponible` `Asignar` is disabled with the reason stated, as on the
+seminar side. An owed figure missing a price counts only when its known part
+already exceeds the balance; the server's refusal stays the last word.
+
+The presets act on **the open tab's selection**: the choreographies on the
+`Coreografías` tab, the `(seminar, academy)` rows on the `Seminarios` tab. A
+selection on the other tab never enables them, so an action never reaches rows
+out of sight.
+
+### Per seminar
+
+On the `Seminarios` tab the same two presets act on the selected
+`(seminar, academy)` rows, which reverses #888's "no seminar preset" now that
+academies pay for several seminar inscriptions at once. Selecting a row means
+every **active** `seminarInscription` the academy holds in that seminar;
+withdrawn ones are never read. `Pagar seña` allocates each one's
+`Seña adeudada`, `Pagar saldo` its `Saldo adeudado`, deposit included, and the
+ones that owe nothing for the stage are skipped, so running a preset twice moves
+nothing the second time.
+
+- **No price picker.** An inscription that holds no price is stored the
+  `seminarPrice` that applies to the person today — the seminar's kind, falling
+  back to `regular`, the person's `forParticipants` cell, open dated rows before
+  the deadline-less one. One that already holds a price keeps it, and **is
+  charged by it**: below its deposit the held row may differ from the row that
+  applies today, and the owed figure, the deposit it crosses (and so the place
+  it takes) and the price the dialog names all come from the held row, so the
+  charge neither stops short of the held deposit nor carries the inscription
+  past the held total. Funding a balance that crosses the deposit goes up to
+  the deposit first and then the rest, because the pool's over-allocation
+  check reads the effective row, which is the held one only from the crossing
+  on.
+- **Places.** Every selected seminar is locked `FOR UPDATE`, in id order, before
+  anything is read, and then the academy's active inscriptions in them, in id
+  order too, so a withdrawal racing the charge is serialised. The academy's
+  pool lock comes last, when the money moves ("The pool rules"), so a charge
+  racing another write for the same academy, on any seminar or choreography,
+  reads the pool that write left. Per seminar, the places needed are the inscriptions the
+  charge carries across their deposit, and the charge is refused when
+  `covered + reserved by others + needed > quota` for any of them — the
+  charge's own reservations are not "others" — naming each seminar short and by
+  how many places. A `Pagar saldo` that crosses a deposit takes a place exactly
+  like a `Pagar seña`.
+- **All or nothing**, as on the choreography side: a seminar short of places, a
+  pool that cannot cover the charge or an inscription nothing prices rolls the
+  whole charge back. Money comes from the pool, oldest payment first, and no
+  payment is created.
+- The client posts the stage and the seminar ids alone; the server recomputes
+  who is charged, at which price and how much (`seminar-cobro-presets.server.ts`).
+  A refusal toasts and keeps the dialog open, so the administrator can
+  deselect or cancel; the loader revalidates, and the dialog's own warnings
+  restate the reason. A success closes the dialog with a toast.
+- **The dialog previews the write.** Per selected seminar it lists the people
+  the charge reaches, with the price each will hold and the amount, and the
+  places left (live reservations of other inscriptions subtracted) against the
+  places the charge takes; the owed figure is those
+  amounts summed. The loader reads it from the same plan the write runs
+  (`readSeminarCobroPreviews`), so preview and write cannot disagree on who,
+  at which price or how many places. `Asignar` is disabled, with the reason
+  stated, when a seminar is short of places (named, with the shortfall) or
+  the owed figure exceeds `Saldo disponible`; the server's checks stay the
+  last word for a state that moved after the dialog opened.
+
+Invoicing stays `Emitir factura` on each `(seminar, academy)` detail.
+
+## Anomalies
+
+A derived **array**, all self-clearing comparisons of current state, persisted
+nowhere, acknowledged nowhere.
+
+| Anomaly         | UI              | Predicate                     |
+| --------------- | --------------- | ----------------------------- |
+| `overAllocated` | `Sobreasignada` | `Σ allocations > totalAmount` |
+
+That is the whole list. `groupTypeMismatch`, `orphanedAllocations` and
+`deriveChoreographyNeedsAttention` were deleted and none of them exists in code.
+A choreography re-derives `overAllocated` from the summed excess of its
+inscriptions, so the **choreography-level anomaly slot is otherwise empty by
+design**.
+
+`Sobreasignada` is `destructive`, not amber: beside `Seña pendiente`, two amber
+badges would read as one kind of fact. It **warns and never blocks**.
+
+> **Specified, not built.**
+> ADR-0014 §5 adds the **documented-versus-derived delta** — `derived total −
+> (FC + ΣND − ΣNC)` — as the second anomaly, split into two members by sign, with
+> a 15-day countdown on withdrawal-driven deltas. Nothing computes it today.
+> Owner: [#657](https://github.com/leomontigatti/en-escena/issues/657).
+
+## Withdrawal from the roster
+
+Removing a dancer from a roster is an **admin-only** action, and it chooses once
+between two outcomes:
+
+- **Physical delete** when the inscription holds neither payment allocations nor
+  a `comprobante_inscription` line. Nothing to preserve.
+- **Withdrawal** otherwise: `withdrawnAt` is stamped and the row survives with
+  its money and its comprobante line on it.
+
+The choice is made at removal and **never revisited** — de-allocating a withdrawn
+inscription afterwards does not delete it. **Nothing cascades**: the removal moves
+no money.
+
+**A withdrawal is final** (#1496). Adding the same dancer again **inserts a new
+inscription**: a new row with its own `createdAt`, priced like any new
+registration, with no money on it. The withdrawn row keeps what it retained and
+its comprobante line, as the record of the drop. If the retained money is to pay
+for the new row, the admin removes it from the withdrawn row with `Quitar
+dinero`, which returns it to `Saldo disponible`, and allocates it to the new row;
+the credit note for the old line and the `Factura C` for the new one are separate
+documents. A revived row was the worse shape fiscally — a billed line partly
+reversed by a credit note and then valid again — and clearing `withdrawnAt`
+erased the record of where the money went.
+
+A withdrawn inscription is not a fourth status. `Retirada` is a derived axis of
+its own, like an anomaly, and it **replaces** the status badge rather than
+joining it.
+
+**A withdrawn inscription's total is what remains allocated to it, not zero.**
+The deposit may be forfeited, and the retained allocation is the record of that
+retention. The consequences follow from that one rule:
+
+- It owes nothing and cannot be over-allocated: `Saldo adeudado`, `Seña adeudada`
+  and the excess are all zero, and it carries no anomalies.
+- It reads `paidInFull` underneath the `Retirada` badge, because what it owes is
+  exactly what it holds.
+- **It keeps exposing its deposit figure**, so the row stays readable.
+- It **stays in** its choreography's and its academy's money rollup.
+- It **stays out of** the `financialStatus` rollup, its choreography's
+  `registrationCount`, and the discount qualifying set.
+- **Price resolution does not know it is withdrawn.** The threshold read resolves
+  a withdrawn row's price exactly like an active one — that is what keeps its
+  deposit figure readable — and so does the allocation write path. What
+  withdrawal removes is the discount's qualifying set, not the price.
+
+**Reads filter withdrawn rows by default**, behind a shared `activeInscription()`
+predicate and its raw-SQL twin, so no reader restates the rule and none writes
+`isNull(withdrawnAt)` by hand. The exceptions come in two kinds.
+
+The first is the finance reads that must **show the evidence**: the money rollup
+consumed by the **four finance surfaces** (`operational-summary.server.ts`), the
+choreography roster the two financial details render with the `Retirada` badge
+(`choreography-inscriptions.server.ts`), the threshold read that keeps a
+withdrawn row's deposit figure alive (`inscription-thresholds.server.ts`), the
+comprobante emitter (`emit-factura-c.server.ts`), and the inscriptions and
+seminars tabs of a roster person's detail, which list the row unbadged with
+what remains allocated as its `Total` (`dancers/inscriptions.server.ts`,
+`roster/inscriptions.server.ts`).
+
+The second is queries that are not about display at all and simply do not need
+the predicate, because a withdrawn row answers their question as well as an
+active one: `readInscriptionSelectedPrices` (the price readout behind the money
+dialog) and the allocation write path's own inscription lookup
+(`inscription-allocation.server.ts`), the price-divergence guard that asks
+whether a move would reprice any money-holding inscription of a choreography
+(`choreography-price-divergence-guard.server.ts`), and the check that refuses
+to delete a price row some inscription references (`prices.server.ts`).
+**Only the first
+kind is five.** Do not read "five exceptions" as "five queries without the
+predicate" — the second kind is at least as large, and a query touching
+`choreography_dancer` without `activeInscription()` is not by itself evidence of
+a bug.
+
+**Known divergence — the write path does not know a row is withdrawn.** Only the
+read path derives the withdrawn figures; an allocation write against a withdrawn
+inscription still computes its thresholds from the price row, so the write-path
+over-allocation guard measures against a `Total` the read side does not show.
+
+**Removing a whole choreography goes through the same chooser**, one level up
+(`docs/domain/choreographies.md`, "Removing a choreography"). `Eliminar
+coreografía` is never refused because of money: with no allocation and no
+`comprobante_inscription` line anywhere on it the choreography is deleted, and
+otherwise it is **withdrawn** — `choreographies.withdrawnAt` and every still
+active inscription stamped with the same timestamp value, in one transaction, no
+money moved. The choice is made under the choreography's row lock and, like the
+per-dancer one, is **never revisited**: de-allocating every peso on a withdrawn
+choreography does not make it deletable. It is **final**: nothing restores it,
+and an academy that wants it back registers a new choreography.
+
+A withdrawn choreography is cut like a withdrawn inscription: its retained money
+**stays in** its own and its academy's rollup, and it is **out of** the status
+rollup and out of every count, with `Retirada` replacing the financial status
+badge (see "Choreography financial status"). Its inscriptions are ordinary
+withdrawn inscriptions, so de-allocating, `Emitir factura` and the eventual
+partial NC all keep working on them — handling that money is the reason the
+choreography survives. The only hard lock on either outcome is an evaluated
+presentation; a comprobante is a reason to withdraw, never a reason to refuse.
+
+**Removing a seminar inscription goes through the same chooser**, on both sides
+(`app/lib/seminars/inscription-withdrawal.server.ts`): the academy keeps its
+removal until the seminar starts and administration keeps its removal at any
+time; a row with no allocation and no comprobante line is deleted, any other is
+withdrawn with its money, its stored row and its `createdAt`. The academy
+therefore has an **academy-driven withdrawal** choreographies do not have. A
+withdrawn seminar inscription owes nothing beyond what it holds, exposes its
+deposit figure, reads `paidInFull` under `Retirada`, stays in the money rollup
+and is out of the status rollup and of the seminar's covered count — withdrawal
+**frees the place**. The withdrawal is final: the same person registered again is
+an ordinary registration that inserts a new row, under the seminar lock and
+the ordinary quota rule, while the withdrawn row keeps its money. De-allocating
+a withdrawn row to zero does not delete it.
+Reads filter withdrawn seminar rows behind the `activeSeminarInscription()` twin
+of the predicate above, with its own raw-SQL twin and no generic predicate over
+two tables.
+
+> **Specified, not built.**
+> ADR-0014 §6 makes the withdrawal's fiscal consequence
+> `NC = línea facturada − retenido`, with the administrator choosing the retained amount in the
+> de-allocation dialog, a full forfeit producing **no credit note at all**,
+> and the 15-day clock running from `withdrawnAt`. None of it is computed today.
+> Historical withdrawals from before the soft withdrawal **cannot be
+> reconstructed and are not backfillable**: the old path hard-deleted the row and
+> cascaded its allocations, destroying the evidence by the very act that required
+> it. How much that costs depends on how many comprobantes were emitted before
+> the soft withdrawal landed, which is a question about the production database
+> and cannot be answered from this repository.
+
+## Invoicing
+
+One `Comprobante` belongs to one **anchor**, and a comprobante that carries a
+CAE is **immutable and undeletable by fiscal obligation**. The anchor is one of
+two, with a `CHECK` requiring exactly one: a **choreography**
+(`choreographyId`), or a **`(seminar, academy)` unit** (`seminarId` plus the
+root's own `academyId`) — the academy's inscriptions in one seminar, which is
+the exact twin of "one per choreography" for a thing sold to many academies at
+once. `academyId` is a not-null column of the root on both kinds, derived from
+the choreography for a choreography comprobante — which is where every row
+predating the column was backfilled from — and taken from the emission input for
+a seminar one. Each is emitted from its own financial detail in the admin panel,
+from a single `Emitir factura` in the header menu; there is no bulk action for
+either kind.
+
+**Every rule below that reads "the same choreography" reads "the same
+anchor"**: the anti-double-billing derivation, annulment by another comprobante
+of the same anchor, and the deletion block.
+
+What is implemented today is **collection-driven emission**, and it is not the
+settled model:
+
+- **Emission bills what was collected**, not the price. The only gate is that
+  there is a positive amount collected and not yet billed; there is no `Señada`
+  gate. Per inscription it bills `collected − already billed` where that is
+  positive, so emission is **incremental and repeatable** rather than
+  all-or-nothing.
+- Internal lines are one row per inscription (`comprobante_inscription`), holding
+  an amount and no text, and naming an inscription of either kind. If the
+  inscription is later hard-deleted the line's target goes null and the line
+  survives. A **withdrawn** seminar inscription is billed like any other: it kept
+  its money, and the comprobante is the evidence of what it retained.
+- **The printed document carries exactly one line**, whose description reads
+  `Inscripción` and nothing else, at the comprobante's total. There is no
+  per-dancer line and no discount line. The description is a constant: it names
+  the service sold, because with `porción` gone a comprobante covers an arbitrary
+  amount and is neither a deposit nor a balance. It carries no right-hand side because
+  the receptor block already prints `{academy} — {choreography}` and there is no
+  dancer to name until #657 renders one line per inscription.
+- Status is derived, never stored, and has **two** values: `valid` and
+  `annulled`. It is derived by **existence** — a comprobante is `annulled` when
+  some other comprobante **of the same anchor** points at it. The one-amendment
+  unique index is untouched by the second anchor: it caps a comprobante at one
+  amendment whatever it is anchored on.
+- **`Vigente` / `Anulada` is the only comprobante badge**, and it is the derived
+  status above, shown on the global comprobante list and detail. The financial
+  detail's `Seña` and `Saldo` metric cards carry **no** badge and **no** link to
+  a comprobante: the `Vigente` / `Desactualizada` pair they used to carry read a
+  `porción` — which valid invoice covered it and whether new money had landed
+  inside it — and went with the field. A choreography's comprobantes are reached
+  from the global list, which searches by choreography name.
+- **`Anular comprobante` exists** as an action on the comprobante detail. It
+  emits a mirror **credit note** for the target's full amount, replicating
+  its lines and pointing at it. A unique index caps a
+  comprobante at **one** amendment ever, and annulling an already-annulled
+  comprobante is refused.
+- There is **no debit note**: only `Factura C` (`CbteTipo` 11) and
+  `Nota de crédito C` (`CbteTipo` 13) exist.
+- A comprobante is emitted as a **service** (WSFEv1 `Concepto` 2).
+- Contingency and recovery when ARCA is unreachable are implemented: a failure is
+  classified by phase, timeouts are wrapper-level constants, and authorization
+  ambiguity is resolved by consulting ARCA rather than by asking the operator.
+  The UI states what was resolved — `rejected` / `not-emitted` / `unverified` —
+  never which call broke.
+- **Any comprobante of an anchor blocks its physical deletion**, in any state,
+  including a credit note. The block is never released: a choreography — or a
+  seminar — that was ever invoiced becomes permanently undeletable. It blocks
+  deletion only, not roster editing. The seminar reference on the root carries no
+  cascade for exactly this reason: the block is the application's to state, in
+  Spanish, not the database's to resolve by destroying the evidence.
+- **Emission is serialised per unit.** Before it reads `cobrado − ya facturado`,
+  an emission takes a transaction-scoped Postgres advisory lock keyed on the
+  anchor — the choreography, or the `(seminar, academy)` pair — and holds it
+  through the authorization and the insert. Two operators pressing `Emitir` at
+  once therefore cannot each see the same unbilled delta and each obtain a CAE
+  for it; the second one finds nothing left to bill. Two academies emitting in
+  the same seminar take different keys and never wait on each other.
+- **The service period is the unit's own.** A choreography bills the event's
+  span; a seminar is taught on one day, so both ends read the seminar's date.
+  `FchVtoPago` is the comprobante's own date on both, because what is billed was
+  already collected.
+- **The anchor reads as one of two units on every surface.** A
+  choreography reads as its name; a seminar reads
+  `Seminario {instructor}, {fecha}`, because a seminar has no name of its own.
+  The printed receptor block is `{academia} — {unidad}` and the single detail
+  line stays the constant `Inscripción` on both kinds, since the receptor block
+  already names what was sold. The global comprobante list holds both kinds in
+  one `Coreografía o seminario` column, each reading linking to its unit's
+  financial detail, and the search matches the academy's name, the
+  choreography's name, the **instructor's** name and the fiscal number; there is
+  **no kind facet** — the reading already says which kind it is. The portal
+  shows no comprobante for either kind. The ADR-0014 §5 model stays the target
+  for **both** kinds under
+  [#657](https://github.com/leomontigatti/en-escena/issues/657).
+
+> **Specified, not built.** This is the largest gap in the document, and it is
+> the whole of ADR-0014 §5, §6 and §7 **minus the one piece already built**: the
+> deletion of `porcion` — column, enum, derivation and every reader — landed
+> ahead of the rest, because the field asserted something untrue the moment the
+> ladder was replaced with two thresholds. What is still specified only:
+>
+> - An invoice is emitted once the choreography is **`Señada` and `total > 0`**,
+>   per choreography, **all-or-nothing**, and it bills the **full price** rather
+>   than what was collected. Collection unlocks emission; it is never the amount.
+> - Every emitter computes the same subtraction, `delta = derived total −
+>   (FC + ΣND − ΣNC)`, and **the sign names the document**: positive → a debit
+>   note, negative → a credit note, zero → nothing. One function serves all
+>   three, and the invariant `FC + ΣND − ΣNC = derived total` makes a roster
+>   change that never got its document _detectable_.
+> - Amendments form a **star anchored at the invoice**, depth permanently 1, which
+>   requires dropping the one-amendment unique index. `Señada` gates the first
+>   document only; ND and NC have no gate at all.
+> - Status becomes `vigente` / `ajustada` / `anulada`, derived **by amount** and a
+>   property of the **invoice alone**; total annulment is the limit case
+>   `ΣNC == FC`.
+> - The printed document carries **one line per inscription**, reading
+>   `Inscripción — {dancer}` at the **net** amount. The discount is **never** a
+>   line item — rendering `Precio / Descuento` would forfeit the fiscal argument
+>   that makes the live discount lawful.
+> - **`Anular comprobante` is deleted**, not rewritten: keeping it would
+>   manufacture a positive delta demanding an ND for the amount just credited.
+>   The comprobante detail is left with no destructive actions.
+> - Refunds are **never netted into** `FC + ΣND − ΣNC`.
+> - Two races get two mechanisms: an advisory lock per choreography for the
+>   delta, and a correlative reservation in its own table for the series.
+>
+> Owner: [#657](https://github.com/leomontigatti/en-escena/issues/657).
+> `Nota de crédito C` and `Nota de débito C` are already verified against ARCA's
+> homologation environment.
+
+## Roster editing and deletion
+
+There is no per-choreography roster lock, no roster state enum, no unlock cycle
+and no request actions. The restriction is **permanent and role-based**.
+
+- **Creation (academy)** is atomic: the choreography is persisted when the last
+  dialog step is confirmed, with roster and professors mandatory, and a final
+  summary warning that the academy will not be able to change it afterwards.
+- **Academy, post-creation:** the only thing it can modify is the audio file. It
+  never edits the roster and never deletes the choreography.
+- **Administrator:** the only one who can modify any choreography data, including
+  the roster, and physically delete it.
+- Roster editing happens in the admin panel's choreography detail, not on a new
+  screen, and unlocks only dancers and professors. Changing the set of dancers
+  re-resolves the group type (by count), the category (by ages) and the
+  experience level (per the category); experience level is editable whenever
+  the resolved category declares levels, and the schedule becomes selectable
+  only when the re-resolution requires it. A roster that does not
+  resolve to a compatible category cannot be saved.
+- **Professors have no financial dimension**: adding or removing them cascades
+  into nothing.
+- The **financial consequence** of a roster change is not resolved in that form.
+  The form produces the membership change; the impact surfaces directly in the
+  financial views, because the minimum rollup pulls the choreography's status
+  down. The save is one draft with one confirmation (`ConfirmDraftDialog`),
+  shown only when it reaches past the edited fields; it lists the schedule
+  moves, including the `Precio por bailarín` before and after, and the
+  inscriptions that end up withdrawn, with no price selection.
+- **Hard blocks.** An evaluated choreography (its presentation has a score or a
+  disqualification) cannot have its roster edited, and can be neither deleted nor
+  withdrawn. That evaluation is the **only** block on removal: a comprobante does
+  not block it, it makes it a withdrawal instead of a delete (see "Withdrawal
+  from the roster"). There is no `has_active_financial_link` column and no editing
+  gate derived from financial state.
+
+## No auditing in finances
+
+- Finances **does not audit changes**. There are no audit entries for payments,
+  allocations, inscriptions or the roster's financial dimension, and no other
+  part of the system audits either — the administrative audit trail was retired.
+- Roles: a single `Administrador` who edits and a single `Auditor` who reads.
+- Financial records carry **no** annulment fields and **no** actor attribution.
+  With a single administrator they distinguish nothing.
+- Destructive actions — deleting a payment, removing a choreography, removing an
+  inscription, taking money off one — run without a reason and leave no entry.
+  The reason a choreography holding money is withdrawn rather than deleted is
+  precisely this: with no audit trail, a cascade would leave only a database
+  backup to reconstruct the allocations from.
+
+## Surfaces
+
+- Finance surfaces are the admin academy financial list and choreography
+  financial detail, the admin payments list and detail, and the two mirrors in
+  the `Portal de academias`. **"The four finance surfaces" elsewhere in this
+  document names a subset of these six**: the four that consume the shared money
+  rollup — the two admin financial ones and the two portal ones. The payments
+  list and detail are finance surfaces too; they just read payments, not the
+  rollup.
+- Panel and portal read the **same derivation**, so the portal cannot disagree
+  with the panel. The primary amounts on both are `Seña adeudada`, `Saldo disponible`
+  and `Saldo adeudado`.
+- **The `Portal de academias` is read-only**: academies do not initiate payments
+  and do not upload receipts. The `Instrucciones de pago` on its payments page
+  (see [Payment instructions](#payment-instructions)) tell an academy how to
+  pay; administration still registers every payment.
+- **The academy is told nothing when its bill moves** — not before a comprobante
+  exists and not after. It is a decision, not an omission: the total the portal
+  renders is already the correct current obligation, nothing about a pending
+  document is actionable by an academy, and the withdrawal signal already exists
+  on the roster axis as the `Retirada` badge, with the retained amount in its
+  `Total`.
+
+Seminar money is read on the same surfaces, split by kind where a unit is named:
+
+- The admin academy list sums both kinds in each academy's figures, and it
+  lists every academy with a choreography, a payment **or a seminar
+  inscription** in the event: an academy that only registered people in a
+  seminar still owes for them.
+- The admin **seminar inscriptions list** (`Finanzas › Seminarios`) is the
+  event's seminar inscriptions across academies, for seeing who owes what for
+  seminars without opening one `(seminar, academy)` detail after another. Its
+  metrics sum the rows its filters leave. A withdrawn inscription is listed
+  while it still holds money, since that money is still the academy's in the
+  seminar. The person's name opens the same money dialog as the detail, and a
+  write stays on the list. It is a second view of the detail's money, read
+  through the same reader, not a replacement for it; it has no `Saldo
+  disponible`, because unallocated money is each academy's pool.
+- The admin academy finances gains `Coreografías` / `Seminarios` tabs.
+  `Seña total`, `Seña adeudada`, `Total` and `Saldo adeudado` follow the active
+  tab; `Saldo disponible` never moves, because unallocated money belongs to
+  neither kind. Each tab keeps its own selection and the owed pair narrows to it.
+  The seminar tab lists the `(seminar, academy)` units — instructor, date,
+  inscriptos, the shared figures and the status — each linking to its financial
+  detail.
+- The admin **`(seminar, academy)` financial detail** is titled by the
+  instructor alone and is the choreography one's twin: the five metrics, the
+  inscriptions table with `Precio` showing the effective row's name and **no
+  `Tipo` column**, the `Retirada` rows with what they retained, and the money
+  dialog behind the person's name. It carries a non-blocking `info` notice while
+  covered and reserved inscriptions fill the seminar's quota. A row holding a
+  live reservation is badged `Reservada` instead of `Seña pendiente`, on this
+  detail, its portal twin and the event-wide seminar inscriptions list, whose
+  `Estado` filters offer it; the `(seminar, academy)` rollups keep the
+  minimum and never read `Reservada`.
+- The `Eliminar pago` impact list names **seminars in the same list as
+  choreographies**, each under the seminar's instructor name, with the money
+  leaving it and how many of its inscriptions drop below their deposit and so
+  lose their place. Deletion never blocks, and removing money by any other
+  gesture stays silent about the place.
+
+- The portal's `Resumen financiero` carries **the same two tabs under the same
+  rules**: the four threshold-and-owed metrics follow the active tab, `Saldo
+  disponible` never moves, each tab keeps its own selection and the owed pair
+  narrows to it. The seminar tab lists the academy's `(seminar, academy)` units
+  with the instructor as the only link.
+- The portal **`(seminar, academy)` financial detail** is that page's twin and
+  the administrator's minus every write: titled by the instructor alone, the
+  five metrics with the academy's `Saldo disponible`, the inscriptions table
+  with `Precio` as the effective row's name, and the full-quota notice repeated.
+  **It is the one portal surface that lists `Retirada` rows**, badged
+  `Retirada`, with the amount they retain in `Total`. There is no money dialog and no comprobante on it. Both
+  sides read the same derivation, so they cannot disagree about an academy's
+  seminar money.
+
+The admin `(seminar, academy)` detail carries `Emitir factura` in its header
+menu, over the fiscal anchor above: it bills every inscription that academy
+holds in that seminar, and it is the only entry point to seminar invoicing.
+
+An **individual** (`Particular`) holds money the way an academy does
+(ADR-0019): its payments, allocations, comprobantes and `Saldo disponible` key
+on its owner row of kind `individual`, and nothing in finances tells the two
+apart beyond these surfaces:
+
+- The admin academy list shows individuals beside academies, with a `Tipo`
+  column and facet (`Academia` / `Particular`). Its financial details, the
+  allocation dialog and the `Pagar seña` / `Pagar saldo` presets work over an
+  individual's seminar inscriptions unchanged.
+- The payment form's picker offers academies and individuals in two titled
+  sections. The global comprobantes list and the collection export carry an
+  individual's comprobantes and payments under its name.
+- A comprobante issued for an individual prints its name in the receptor
+  block, never its document. The fiscal receptor sent to ARCA stays the final
+  consumer, as for an academy.
+- `Descuento por bailarín` does not apply: an individual holds no choreography
+  inscriptions.
+- The individual's area has a `Finanzas` group, read-only, shaped like the
+  portal's: `Seminarios`, the five metrics over its own account and its
+  seminars with their status, and `Pagos`, its payments under the event's
+  `Instrucciones de pago`. Comprobantes are not shown to individuals, as they
+  are not to academies.
+
+## Retired vocabulary
+
+These name nothing and must not come back. The glossary tombstones the ones that
+had entries.
+
+| Retired                                         | What replaced it                                    |
+| ----------------------------------------------- | --------------------------------------------------- |
+| `Etapa de inscripción`, `inscriptionStage`      | the two thresholds and the three statuses           |
+| `Precio tentativo` / `Precio congelado`         | one `selectedPrice` per inscription                 |
+| `Fecha de referencia financiera`                | the business date, on the read path only            |
+| `frozenBasePriceAmount` and the nine siblings   | derivation from `selectedPrice` and `Σ allocations` |
+| `allocation_type`, `allocationDeletionRank`     | nothing — money is fungible                         |
+| `Saldo de inscripción`                          | `Total de inscripción`                              |
+| `Cuenta corriente de academia`                  | nothing — it never named a symbol (see below)       |
+| `choreographyFinancialState` (watermark)        | the minimum rollup                                  |
+| `deriveChoreographyNeedsAttention`              | the minimum rollup                                  |
+| `groupTypeMismatch`, `orphanedAllocations`      | nothing                                             |
+| `Imputación`, choreography invoice              | `paymentAllocation`, `comprobante`                  |
+| `Porción`, `comprobantePorcion`                 | nothing — a comprobante covers an amount            |
+| `Desactualizada` (the `porción` currency badge) | nothing — the cards carry no badge                  |
+
+Three of those rows retire a **concept**, not every string that spells it, and
+the difference matters to anyone about to delete something:
+
+- **`Cuenta corriente de academia`** retires the _entity_ — there is no
+  account-balance record, and no `academyAccountBalance` identifier. The words
+  survive only as UI copy an academy reads, which this table does not cover: the
+  portal's finance page is titled `Resumen financiero`
+  (`app/features/portal/finances/view.tsx`), and the card that links to it from
+  `app/routes/portal._index.tsx` still describes it as their cuenta corriente.
+- **`Fecha de referencia financiera`** retires the _per-inscription column_; both
+  reference-date columns were dropped. The words no longer appear in
+  code either: the read path takes the shared business date as a `businessDate`
+  parameter of `selectApplicableInscriptionPrice`, which is not a financial
+  concept and needs no term.
+- **`Porción`** retires the _classification_: the column, its pgEnum, its
+  derivation and its printed label are gone, and no identifier spells it. But
+  `readComprobantesListFilters` still calls `searchParams.delete("porcion")`,
+  alongside the same call for `academia`, so an old bookmarked list URL is
+  canonicalised rather than kept alive. That is a query parameter being scrubbed,
+  not a concept being read.

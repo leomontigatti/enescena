@@ -1,0 +1,26 @@
+{
+  "description": "The same hooks as .claude/settings.json; the scripts live in .agents/hooks and read either harness's payload. The shared hooks (check-tool-path, block-pkill-f) are wired at user level by leomontigatti/agent-workflow's install.sh.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/.agents/hooks/format-edited-file.sh\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/.agents/hooks/stop-typecheck-lint.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,36 @@
+# Events
+
+Rules for event context, `Bases del evento`, administration and portal behavior.
+
+## Events and `Bases del evento`
+
+- `Evento activo` is the only event context in V1 for `Panel de administración` and `Portal de academias`. Lists, event-specific mutations, choreographies, financial operations, scores and awards use it unless a detail route identifies one explicit `Evento` by URL.
+- At most one `Evento activo` can exist globally; there can also be none.
+- `Estado del evento` is automatic from dates: no iniciado, en curso, finalizado. It is not the same as active.
+- `Resultados publicados` is a snapshot administration takes of the active event from the `Resultados` list, independent of the event's temporal state: `Mostrar resultados` publishes the presentations evaluated at that moment, `Actualizar resultados` adds the ones evaluated since, and `Ocultar resultados` takes them all down. There is no precondition, and corrections to a published presentation reach the academy without publishing again — see [judging.md](judging.md#program-and-results).
+- `Cronograma` dates and times are local business dates/times, without their own timezone.
+- A `Cupo de cronograma` consumes capacity inside a `Cronograma`; the sum of its capacities cannot exceed the `Cronograma` capacity.
+- A `Cronograma` accepts modalities, and optionally categories: listing no category means it accepts every one of them. A listed category has to belong to the event and share a modality with the schedule's accepted modalities, re-checked on every save, and cannot be deleted while a `Cronograma` lists it.
+- A choreography first uses a `Cupo de cronograma` when schedule modality and capacity group type are compatible.
+- If a compatible `Cronograma` has no `Cupo de cronograma` for the choreography group type, the choreography falls back to the `Cronograma` total capacity as global capacity.
+- A `Cupo de cronograma` can be deleted under a `Coreografía retirada` — the reference is released — while a `Cronograma` cannot be deleted while any choreography, withdrawn or not, is assigned to it. Its own `Cupos de cronograma` do not hold it: they are deleted with it. The asymmetry and its refusal are stated in [choreographies.md](choreographies.md#a-withdrawn-choreography).
+- `Bases del evento` includes modalities, submodalities, categories, experience levels, schedules, schedule capacities and prices. It does not include Events.
+- An `Evento` carries no registration window of its own: inscriptions are opened and closed by hand, one `Cronograma` at a time, through its `registrationOpen` switch. The event's own fact — `Inscripciones abiertas` or `Inscripciones cerradas` — is derived from its schedules, open when any of them is, and computed by the portal event-context module alone.
+- `Abrir inscripciones` on a `Cronograma` is refused while its event's registration readiness fails, or once the event's end date has passed; the missing items are the reasons, listed on the schedule detail. `Cerrar inscripciones` never fails. In particular, inscriptions cannot be opened while the event's categories leave an age uncovered: for every `Modalidad` and `Tipo de grupo` its categories reach, ages 1 to 100 must be covered by exactly one `Categoría`. A gap is a choreography that cannot be placed; an overlap makes the `Categoría` depend on the order the `Bases del evento` load in. A `Modalidad` that declares no `Categoría` at all for a `Tipo de grupo` is offering nothing there and is not asked for coverage; a choreography never lands on that pair either, because registration refuses a choreography that resolves to no category.
+- Registration readiness resolves a schedule the same way registration does, categories included: a `Categoría` that no `Cronograma` accepts for a `Modalidad` and `Tipo de grupo` it reaches is reported as a missing compatible schedule capacity, so a category left out of every show surfaces in the readiness instead of blocking a registration.
+
+## Administration and portal
+
+- `Portal de academias` can manage professors and dancers even without an active event.
+- Portal choreographies stays visible without active event, showing an empty state.
+- With every `Cronograma` closed, the portal reads `Las inscripciones están cerradas.`, shows existing choreographies, disables new ones, and still allows deleting eligible unpaid choreographies.
+- Portal price/payment view shows all academy choreographies, including unpaid and incomplete ones.
+- An event may carry `Instrucciones de pago` — the bank identifiers and how-to-pay text an academy reads on the portal payments page and an individual on its `Pagos`. They are loaded on the event detail, are not part of `Bases del evento`, and never enter registration readiness. The rules live in [finances.md](finances.md#payment-instructions).
+- Academy sees price after creating a choreography, not during registration.
+- Admin dashboard lists are operational views; direct `/administracion/*` sections hold global event management and `Bases del evento`.
+- Administration does not create choreographies, professors or dancers in ordinary flows; those belong to portal.
+- Admin choreographies are separated by axis: operational, financial and participation.
+- Academies, professors and dancers have `Participando` filter active by default in admin when they have inscriptions in the active event.
+- Participation badges are hidden in both admin and portal when there is no active event, so a row is never read as `No participando` without an event to participate in.
+- `Acción de lista` handles selected sets and can process eligible rows while reporting omitted rows.
+- `Acción de instancia` handles operations that need full instance context.
