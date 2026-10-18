@@ -1,7 +1,9 @@
 {
   "$schema": "https://raw.githubusercontent.com/fallow-rs/fallow/main/schema.json",
-  // `shadcn` is a CLI run by hand to add components (docs/agents/shadcn.md);
-  // nothing imports it.
+  // `shadcn` is a dev dependency on purpose: besides the CLI that adds
+  // components (docs/agents/shadcn.md), it provides `shadcn/tailwind.css`, which
+  // src/styles.css imports and Vite bundles at build time. The runtime image is
+  // pruned to production dependencies and does not need it.
   "ignoreDependencies": ["shadcn"],
   "duplicates": {
     // Pair-only clones are hidden; widespread copy-paste is what is worth a refactor.

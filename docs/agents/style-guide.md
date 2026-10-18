@@ -24,6 +24,14 @@ is not built here yet: these are the product decisions carried over from en-esce
 - **A shadcn component before custom markup**, added when the case fits it, never installed
   without a use.
 
+## Motion
+
+- **A record's name morphs from its row in a list into its detail page's title**, and back on
+  `Volver`: a 160 ms view transition of the name alone, while the rest of the page swaps at once,
+  with no crossfade. Reduced motion makes it instant. It comes from en-escena (its record title and
+  the `[data-record-title]` rules in `app/app.css`) and arrives with the first list and detail
+  screens.
+
 ## Viewports
 
 - **Design at 1440 px; everything works down to 1280 px.** At 1280 the admin sidebar leaves about
